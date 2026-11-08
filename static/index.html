@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agenda Clínica</title>
+  <style>
+    :root { --bg:#f7f8f7; --fg:#1c2321; --muted:#667; --line:#dde3df; --accent:#0f766e; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin:0; font:15px/1.5 system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--fg); }
+    main { max-width:820px; margin:0 auto; padding:2rem 1rem 4rem; }
+    h1 { font-size:1.4rem; margin:0 0 1.25rem; } h2 { font-size:1rem; margin:1.75rem 0 .6rem; }
+    .row { display:flex; gap:.6rem; flex-wrap:wrap; align-items:end; }
+    label { display:flex; flex-direction:column; font-size:.82rem; color:var(--muted); gap:.2rem; }
+    select, input, button { font:inherit; padding:.45rem .6rem; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--fg); }
+    button { background:var(--accent); border-color:var(--accent); color:#fff; cursor:pointer; }
+    button.slot { background:#fff; color:var(--accent); border-color:var(--accent); padding:.3rem .6rem; }
+    button.slot.chosen { background:var(--accent); color:#fff; }
+    button.link { background:none; border:none; color:#b3261e; padding:0; text-decoration:underline; }
+    .slots { display:flex; flex-wrap:wrap; gap:.4rem; }
+    table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); }
+    th, td { padding:.5rem .7rem; text-align:left; border-bottom:1px solid var(--line); font-size:.9rem; }
+    .msg { min-height:1.4em; color:#b3261e; } .msg.ok { color:#166534; }
+    .muted { color:var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Agenda Clínica</h1>
+
+  <div class="row">
+    <label>Profissional <select id="prof"></select></label>
+    <label>Dia <input type="date" id="day"></label>
+    <label>Duração
+      <select id="duration"><option>30</option><option>45</option><option>60</option><option>15</option></select>
+    </label>
+  </div>
+
+  <h2>Horários livres</h2>
+  <div class="slots" id="slots"></div>
+
+  <div id="booking" hidden>
+    <h2>Agendar <span id="chosen"></span></h2>
+    <div class="row">
+      <label>Paciente <select id="patient"></select></label>
+      <button id="book">Confirmar</button>
+    </div>
+  </div>
+  <p class="msg" id="msg"></p>
+
+  <h2>Consultas do dia</h2>
+  <table>
+    <thead><tr><th>Horário</th><th>Paciente</th><th>Situação</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let chosen = null;
+  let patients = {};
+
+  const hhmm = (iso) => iso.slice(11, 16);
+  const errors = {
+    outside_working_hours: 'Fora do horário de atendimento.', professional_busy: 'O profissional já tem consulta nesse horário.',
+    patient_busy: 'O paciente já tem consulta nesse horário.', in_the_past: 'Esse horário já passou.',
+  };
+
+  async function get(path) { return (await fetch(path)).json(); }
+  function opt(value, text) { const o = document.createElement('option'); o.value = value; o.textContent = text; return o; }
+
+  async function init() {
+    const [profs, pats] = await Promise.all([get('/professionals'), get('/patients')]);
+    $('prof').replaceChildren(...profs.map((p) => opt(p.id, p.name + ' · ' + p.specialty)));
+    $('patient').replaceChildren(...pats.map((p) => opt(p.id, p.name)));
+    patients = Object.fromEntries(pats.map((p) => [p.id, p.name]));
+    $('day').value = new Date(Date.now() + 864e5).toISOString().slice(0, 10);
+    refresh();
+  }
+
+  async function refresh() {
+    chosen = null; $('booking').hidden = true;
+    const pid = $('prof').value, day = $('day').value;
+    if (!pid || !day) return;
+
+    const av = await get(`/professionals/${pid}/availability?date=${day}&duration=${$('duration').value}`);
+    const box = $('slots');
+    box.replaceChildren();
+    if (!av.slots.length) { const p = document.createElement('span'); p.className = 'muted'; p.textContent = 'Sem horários nesse dia.'; box.append(p); }
+    for (const s of av.slots) {
+      const b = document.createElement('button');
+      b.className = 'slot'; b.textContent = hhmm(s);
+      b.onclick = () => {
+        chosen = s; $('chosen').textContent = 'às ' + hhmm(s); $('booking').hidden = false;
+        box.querySelectorAll('.slot').forEach((x) => x.classList.toggle('chosen', x === b));
+      };
+      box.append(b);
+    }
+
+    const list = await get(`/appointments?professional_id=${pid}&date=${day}`);
+    const rows = $('rows'); rows.replaceChildren();
+    for (const a of list) {
+      const tr = document.createElement('tr');
+      for (const text of [hhmm(a.starts_at) + '–' + hhmm(a.ends_at), patients[a.patient_id] || '#' + a.patient_id, a.status === 'scheduled' ? 'agendada' : 'cancelada']) {
+        const td = document.createElement('td'); td.textContent = text; tr.append(td);
+      }
+      const act = document.createElement('td');
+      if (a.status === 'scheduled') {
+        const c = document.createElement('button'); c.className = 'link'; c.textContent = 'cancelar';
+        c.onclick = async () => { await fetch(`/appointments/${a.id}/cancel`, { method: 'PATCH' }); refresh(); };
+        act.append(c);
+      }
+      tr.append(act); rows.append(tr);
+    }
+  }
+
+  $('book').onclick = async () => {
+    const res = await fetch('/appointments', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ professional_id: +$('prof').value, patient_id: +$('patient').value, starts_at: chosen, duration_min: +$('duration').value }),
+    });
+    const body = await res.json();
+    $('msg').className = res.ok ? 'msg ok' : 'msg';
+    $('msg').textContent = res.ok ? 'Consulta agendada.' : (errors[body.detail?.code] || body.detail?.message || 'Não foi possível agendar.');
+    refresh();
+  };
+
+  for (const id of ['prof', 'day', 'duration']) $(id).onchange = refresh;
+  init();
+</script>
+</body>
+</html>
